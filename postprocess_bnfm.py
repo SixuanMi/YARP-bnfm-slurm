@@ -79,13 +79,44 @@ def reaction_key(h1: float, h2: float) -> Tuple[float, float]:
 
 def species_smiles(spec: Dict) -> Tuple[str, str]:
     elements = [element.upper() for element in spec["elements"]]
-    bmat = np.array(spec["bond_mats"][0])
+    bmat_raw = np.array(spec["bond_mats"])
+    if bmat_raw.ndim == 3:
+        bmat = bmat_raw[0]
+    elif bmat_raw.ndim == 2:
+        bmat = bmat_raw
+    elif bmat_raw.ndim == 1:
+        side = int(round(len(bmat_raw) ** 0.5))
+        if side * side != len(bmat_raw):
+            raise ValueError(f"Unable to reshape bond_mats of length {len(bmat_raw)} into square matrix.")
+        bmat = bmat_raw.reshape((side, side))
+    else:
+        raise ValueError(f"Unexpected bond_mats shape: {bmat_raw.shape}")
     fc = return_formals(bmat, elements)
     return return_smi(elements, bmat, fc)
 
 
 def process(input_path: str, output_path: str) -> None:
-    raw = pickle.load(open(input_path, "rb"))
+    # Support both single-list pickle and streamed pickles (one list per iteration)
+    raw = []
+    with open(input_path, "rb") as f:
+        try:
+            first = pickle.load(f)
+        except EOFError:
+            first = []
+        if isinstance(first, list):
+            raw.extend(first)
+        else:
+            raw.append(first)
+        # Read any additional pickled chunks (for streamed outputs)
+        while True:
+            try:
+                chunk = pickle.load(f)
+            except EOFError:
+                break
+            if isinstance(chunk, list):
+                raw.extend(chunk)
+            else:
+                raw.append(chunk)
 
     dedup_reactions = {}
     for entry in raw:

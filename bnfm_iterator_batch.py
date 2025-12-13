@@ -13,7 +13,7 @@ Given one or more SMILES reactants, this module will:
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import logging
 import pickle
 import time
@@ -23,6 +23,7 @@ import yarp as yp
 from yarp.yarpecule import yarpecule
 
 MAX_BOND_ORDER = 3
+SCRIPT_START = time.time()
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -31,10 +32,12 @@ logger.setLevel(logging.INFO)
 def configure_logging(log_file: str) -> None:
     """Configure file and console logging once."""
     if logger.handlers:
-        return
+        for handler in list(logger.handlers):
+            logger.removeHandler(handler)
+            handler.close()
     formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 
-    fh = logging.FileHandler(log_file)
+    fh = logging.FileHandler(log_file, mode="w")
     fh.setFormatter(formatter)
     logger.addHandler(fh)
 
@@ -142,6 +145,9 @@ def enumerate_reactant(
                     continue
                 if sum(1 for chg in prod.fc if chg != 0) > 2:
                     continue
+                charged_atoms = [idx for idx, chg in enumerate(prod.fc) if chg != 0]
+                if len(charged_atoms) == 2 and prod.adj_mat[charged_atoms[0], charged_atoms[1]] != 1:
+                    continue
                 if prod.hash in local_hashes:
                     continue
                 local_hashes.add(prod.hash)
@@ -173,15 +179,21 @@ def iterate_bnfm(
     output_path: str = "bnfm_results.pkl",
     log_file: str = "bnfm_iterator.log",
     max_workers: int = 1,
+    retain_results: bool = False,
+    start_time: Optional[float] = None,
 ) -> List[Dict[str, object]]:
     """
     Run iterative BNFM enumeration until no new species are found.
 
-    The output is a list of records suitable for pickling, each containing a reactant
-    entry and its filtered, de-duplicated products (deduplication is local to each
-    reactant; global hashes are only used for loop termination).
+    Records are written to ``output_path`` in batches (one pickle dump per iteration)
+    to avoid holding the full result set in memory. The output file is therefore a
+    stream of pickled lists; use repeated pickle.load calls to consume it. Each record
+    contains a reactant entry and its filtered, de-duplicated products (deduplication
+    is local to each reactant; global hashes are only used for loop termination). Set
+    retain_results=True to also accumulate and return the full list in memory.
     """
     configure_logging(log_file)
+    run_start = time.time() if start_time is None else start_time
 
     # initialize reactants
     initial_reactants: List[yarpecule] = []
@@ -193,55 +205,111 @@ def iterate_bnfm(
         global_hashes.add(mol.hash)
         initial_reactants.append(mol)
 
-    results: List[Dict[str, object]] = []
+    results: List[Dict[str, object]] = [] if retain_results else []
     frontier = initial_reactants
     processed_reactants: Set[float] = set()
     iteration = 0
 
-    while frontier:
-        # skip any molecules that were already enumerated as reactants
-        frontier = [r for r in frontier if r.hash not in processed_reactants]
-        if not frontier:
-            break
+    with open(output_path, "wb") as output_file:
+        while frontier:
+            # skip any molecules that were already enumerated as reactants
+            frontier = [r for r in frontier if r.hash not in processed_reactants]
+            if not frontier:
+                break
 
-        pre_species = len(global_hashes)
-        worker_count = max(1, min(max_workers, len(frontier)))
-        logger.info(
-            "Iteration %d: starting enumeration with %d frontier reactants (%d known species total, %d workers)",
-            iteration,
-            len(frontier),
-            pre_species,
-            worker_count,
-        )
-        new_frontier: List[yarpecule] = []
-        task_args = [
-            (reactant, max_break, max_form, score_threshold) for reactant in frontier
-        ]
-        if worker_count > 1:
-            with ProcessPoolExecutor(max_workers=worker_count) as executor:
-                batch_results = list(executor.map(_enumerate_reactant_task, task_args))
-        else:
-            batch_results = [_enumerate_reactant_task(args) for args in task_args]
+            iter_start = time.time()
+            pre_species = len(global_hashes)
+            worker_count = max(1, min(max_workers, len(frontier)))
+            logger.info(
+                "Iteration %d: starting enumeration with %d frontier reactants (%d known species total, %d workers)",
+                iteration,
+                len(frontier),
+                pre_species,
+                worker_count,
+            )
+            new_frontier: List[yarpecule] = []
+            iteration_records: List[Dict[str, object]] = []
+            task_args = [
+                (reactant, max_break, max_form, score_threshold) for reactant in frontier
+            ]
+            total_frontier = len(frontier)
+            completed = 0
 
-        for (products, record), reactant in zip(batch_results, frontier):
-            processed_reactants.add(reactant.hash)
-            results.append(record)
-            novel_products = [p for p in products if p.hash not in global_hashes]
-            global_hashes.update(_.hash for _ in novel_products)
-            new_frontier.extend(novel_products)
+            def consume_result(
+                products: List[yarpecule], record: Dict[str, object], reactant_hash: float
+            ) -> None:
+                processed_reactants.add(reactant_hash)
+                iteration_records.append(record)
+                if retain_results:
+                    results.append(record)
+                for prod in products:
+                    if prod.hash in global_hashes:
+                        continue
+                    global_hashes.add(prod.hash)
+                    new_frontier.append(prod)
+                products.clear()
 
-        added_species = len(global_hashes) - pre_species
-        logger.info(
-            "Iteration %d: added %d new species", iteration, added_species
-        )
+            if worker_count > 1:
+                with ProcessPoolExecutor(max_workers=worker_count) as executor:
+                    future_map = {}
+                    start_map = {}
+                    for arg in task_args:
+                        fut = executor.submit(_enumerate_reactant_task, arg)
+                        future_map[fut] = arg[0]
+                        start_map[fut] = time.time()
+                    for fut in as_completed(future_map):
+                        reactant = future_map[fut]
+                        products, record = fut.result()
+                        completed += 1
+                        elapsed = time.time() - start_map[fut]
+                        logger.info(
+                            "Iteration %d progress %d/%d | reactant hash=%s | elapsed %.2fs",
+                            iteration,
+                            completed,
+                            total_frontier,
+                            reactant.hash,
+                            elapsed,
+                        )
+                        consume_result(products, record, reactant.hash)
+            else:
+                for args in task_args:
+                    reactant = args[0]
+                    reactant_start = time.time()
+                    products, record = _enumerate_reactant_task(args)
+                    completed += 1
+                    elapsed = time.time() - reactant_start
+                    logger.info(
+                        "Iteration %d progress %d/%d | reactant hash=%s | elapsed %.2fs",
+                        iteration,
+                        completed,
+                        total_frontier,
+                        reactant.hash,
+                        elapsed,
+                    )
+                    consume_result(products, record, reactant.hash)
 
-        if not new_frontier:
-            break
-        frontier = new_frontier
-        iteration += 1
+            if iteration_records:
+                # Stream current iteration to disk to avoid holding all records in memory.
+                pickle.dump(iteration_records, output_file, protocol=pickle.HIGHEST_PROTOCOL)
+                output_file.flush()
+                iteration_records.clear()
 
-    with open(output_path, "wb") as f:
-        pickle.dump(results, f)
+            added_species = len(global_hashes) - pre_species
+            iter_elapsed = time.time() - iter_start
+            logger.info(
+                "Iteration %d: added %d new species | elapsed %.2fs",
+                iteration,
+                added_species,
+                iter_elapsed,
+            )
+
+            if not new_frontier:
+                break
+            frontier = new_frontier
+            iteration += 1
+
+    total_elapsed = time.time() - run_start
+    logger.info("Done! elapsed %.2fs", total_elapsed)
 
     return results
 
@@ -287,7 +355,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-workers",
         type=int,
-        default=55,
+        default=54,
         help="Maximum parallel workers to enumerate frontier reactants within an iteration.",
     )
     return parser.parse_args()
@@ -303,6 +371,7 @@ def main() -> None:
         output_path=args.output,
         log_file=args.log_file,
         max_workers=args.max_workers,
+        start_time=SCRIPT_START,
     )
 
 
