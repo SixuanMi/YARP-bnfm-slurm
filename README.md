@@ -30,3 +30,17 @@
 
 ### Notes
 - [autoCG](https://github.com/Romarin87/autoCG) can be used for generating 3D.
+
+## Modifications relative to upstream YARP
+- Scoring weights: `w_aro` adjusted from `-24` to `-2.4`.
+- Carbene bonus: recognize carbon with element `c`, formal charge `0`, and 6 valence electrons as a carbene; add a bonus of `-4.931` to the score when present.
+
+## BNFM filtering additions
+Within `bnfm_iterator_batch.py` products are filtered with:
+- Drop if any bond order > 3.
+- Drop if any formal charge has |charge| > 1.
+- Drop if more than two atoms carry non-zero formal charges.
+- Drop if two charged atoms are not directly bonded to each other.
+
+## Recommended convergence threshold
+Use a score threshold of `0.15` to retain carbene (~0.149), CO(~0.131), and isocyanate(~0.077) non-standard Lewis structures, while block N2O(~0.203), N1C=C1(~0.800).
