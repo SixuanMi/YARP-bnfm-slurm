@@ -4,7 +4,7 @@
 - Use the existing [YARP environment](https://github.com/Savoie-Research-Group/yarp)
 
 ### What’s here
-- `bnfm_iterator.py` / `bnfm_iterator_batch.py`: iterative BNFM enumeration (b0f0 ~ b3f3 by default), with local dedup per reactant and optional parallel execution.
+- `bnfm_iterator_batch.py`: iterative BNFM enumeration (b0f0 ~ b3f3 by default), with local dedup per reactant and optional parallel execution.
 - `postprocess_bnfm.py`: deduplicate reactions/products from the iterator output and generate reaction SMILES.
 - `run_single_smiles.sh`: convenience wrapper to pick a SMILES line from `unique_smiles.txt` and run the iterator.
 
