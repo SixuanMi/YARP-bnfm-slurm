@@ -428,14 +428,6 @@ def iterate_bnfm(
 
             iter_start = time.time()
             pre_species = len(global_hashes)
-            worker_count = max(1, min(max_workers, len(frontier)))
-            logger.info(
-                "Iteration %d: starting enumeration with %d frontier reactants (%d known species total, %d workers)",
-                iteration,
-                len(frontier),
-                pre_species,
-                worker_count,
-            )
             new_frontier: List[yarpecule] = []
             iteration_records: List[Dict[str, object]] = []
             iteration_products_total = 0
@@ -456,6 +448,15 @@ def iterate_bnfm(
 
             total_tasks = len(task_args)
             completed_tasks = 0
+            worker_count = max(1, min(max_workers, total_tasks))
+            logger.info(
+                "Iteration %d: starting enumeration with %d frontier reactants (%d known species total, %d combos, %d workers)",
+                iteration,
+                len(frontier),
+                pre_species,
+                total_tasks,
+                worker_count,
+            )
 
             def consume_result(
                 products: List[yarpecule], reactant_hash: float
